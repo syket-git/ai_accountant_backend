@@ -1,4 +1,5 @@
 node_modules
+supabase-migrations.sql
 .env
 .env.local
 .env.development.local
