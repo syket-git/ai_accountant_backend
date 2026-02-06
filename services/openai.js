@@ -57,8 +57,8 @@ export async function extractExpenseData(text, userId) {
   try {
     // Get current date
     const today = new Date().toISOString().split("T")[0];
-    
-    const systemPrompt = `You are an AI assistant for an expense tracking application. 
+
+    const systemPrompt = `You are an AI assistant for an expense tracking application.
 Your job is to extract structured financial transaction data from user input.
 
 IMPORTANT: Today's date is ${today}. Use this as the default date unless the user specifies a different date.
