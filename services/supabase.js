@@ -76,6 +76,145 @@ export async function deleteTransaction(transactionId) {
 }
 
 /**
+ * Save a new loan to the database
+ */
+export async function saveLoan(data) {
+  try {
+    const { data: loan, error } = await supabase
+      .from("loans")
+      .insert({
+        user_id: data.userId,
+        lender_name: data.lender_name,
+        loan_type: data.loan_type,
+        principal_amount: data.principal_amount,
+        interest_rate: data.interest_rate || 0,
+        tenure_months: data.tenure_months || null,
+        monthly_installment: data.monthly_installment || null,
+        total_paid: 0,
+        remaining_balance: data.principal_amount,
+        currency: data.currency || "BDT",
+        status: "active",
+        start_date: data.date,
+        notes: data.notes || null,
+      })
+      .select()
+      .single();
+
+    if (error) throw error;
+    return loan;
+  } catch (error) {
+    console.error("Error saving loan:", error);
+    throw error;
+  }
+}
+
+/**
+ * Get all loans for a user
+ */
+export async function getLoans(userId) {
+  try {
+    const { data, error } = await supabase
+      .from("loans")
+      .select("*")
+      .eq("user_id", userId)
+      .order("created_at", { ascending: false });
+
+    if (error) throw error;
+    return data || [];
+  } catch (error) {
+    console.error("Error fetching loans:", error);
+    throw error;
+  }
+}
+
+/**
+ * Delete a loan
+ */
+export async function deleteLoan(loanId) {
+  try {
+    const { error } = await supabase
+      .from("loans")
+      .delete()
+      .eq("id", loanId);
+
+    if (error) throw error;
+    return { success: true };
+  } catch (error) {
+    console.error("Error deleting loan:", error);
+    throw error;
+  }
+}
+
+/**
+ * Record a loan repayment: find matching loan, update balance, save transaction
+ */
+export async function recordLoanRepayment(userId, lenderName, amount, date, currency) {
+  try {
+    // Find active loan matching lender name (case-insensitive)
+    const { data: loans, error: findError } = await supabase
+      .from("loans")
+      .select("*")
+      .eq("user_id", userId)
+      .eq("status", "active")
+      .ilike("lender_name", `%${lenderName}%`);
+
+    if (findError) throw findError;
+
+    if (!loans || loans.length === 0) {
+      // No matching loan found — still save as expense transaction
+      await saveTransaction({
+        userId,
+        amount,
+        currency: currency || "BDT",
+        category: "loan_repayment",
+        notes: `Loan repayment to ${lenderName} (no matching loan found)`,
+        type: "expense",
+        date,
+      });
+      return { loan: null, message: `No active loan found for "${lenderName}". Recorded as expense.` };
+    }
+
+    const loan = loans[0];
+    const newTotalPaid = Number(loan.total_paid) + Number(amount);
+    const newRemaining = Number(loan.remaining_balance) - Number(amount);
+    const newStatus = newRemaining <= 0 ? "paid_off" : "active";
+
+    // Update loan
+    const { error: updateError } = await supabase
+      .from("loans")
+      .update({
+        total_paid: newTotalPaid,
+        remaining_balance: Math.max(0, newRemaining),
+        status: newStatus,
+      })
+      .eq("id", loan.id);
+
+    if (updateError) throw updateError;
+
+    // Save as expense transaction
+    await saveTransaction({
+      userId,
+      amount,
+      currency: currency || "BDT",
+      category: "loan_repayment",
+      notes: `Loan repayment to ${loan.lender_name}`,
+      type: "expense",
+      date,
+    });
+
+    return {
+      loan: { ...loan, total_paid: newTotalPaid, remaining_balance: Math.max(0, newRemaining), status: newStatus },
+      message: newStatus === "paid_off"
+        ? `Loan from ${loan.lender_name} fully paid off!`
+        : `Repayment recorded. Remaining: ${Math.max(0, newRemaining).toFixed(2)} ${loan.currency}`,
+    };
+  } catch (error) {
+    console.error("Error recording loan repayment:", error);
+    throw error;
+  }
+}
+
+/**
  * Get transaction summary for a user (total expenses, income, by category, etc.)
  */
 export async function getTransactionSummary(userId, startDate, endDate) {
@@ -131,6 +270,27 @@ export async function getTransactionSummary(userId, startDate, endDate) {
     return summary;
   } catch (error) {
     console.error("Error fetching transaction summary:", error);
+    throw error;
+  }
+}
+
+/**
+ * Save user feedback to the database
+ */
+export async function saveFeedback(data) {
+  try {
+    const { error } = await supabase.from("feedback").insert({
+      user_id: data.userId,
+      user_name: data.userName || null,
+      user_email: data.userEmail || null,
+      rating: data.rating,
+      comment: data.comment || null,
+    });
+
+    if (error) throw error;
+    return { success: true };
+  } catch (error) {
+    console.error("Error saving feedback:", error);
     throw error;
   }
 }

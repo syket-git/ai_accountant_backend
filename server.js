@@ -3,7 +3,12 @@ import dotenv from "dotenv";
 import express from "express";
 import multer from "multer";
 import { extractExpenseData, transcribeAudio } from "./services/openai.js";
-import { saveTransaction } from "./services/supabase.js";
+import {
+  saveTransaction,
+  saveLoan,
+  recordLoanRepayment,
+  saveFeedback,
+} from "./services/supabase.js";
 
 dotenv.config();
 
@@ -49,31 +54,65 @@ app.post("/api/process", upload.single("file"), async (req, res) => {
       return res.status(400).json({ error: "Invalid mode or missing data" });
     }
 
-    // Extract expense/income data using OpenAI
-    console.log("Extracting expense data...");
-    const expenseData = await extractExpenseData(inputText, userId);
-    console.log("Extracted data:", expenseData);
+    // Extract data using OpenAI (now with intent detection)
+    console.log("Extracting data...");
+    const extractedData = await extractExpenseData(inputText, userId);
+    console.log("Extracted data:", extractedData);
 
-    // Save to Supabase
-    if (expenseData.amount && expenseData.type) {
-      await saveTransaction({
-        userId,
-        amount: expenseData.amount,
-        currency: expenseData.currency || "BDT",
-        category: expenseData.category || "other",
-        notes: expenseData.notes || inputText,
-        type: expenseData.type,
-        date: expenseData.date || new Date().toISOString().split("T")[0],
-      });
+    let response;
+
+    if (extractedData.intent === "new_loan") {
+      // Handle new loan
+      if (extractedData.principal_amount) {
+        const loan = await saveLoan({ userId, ...extractedData });
+        // Also record as income transaction (money received)
+        await saveTransaction({
+          userId,
+          amount: extractedData.principal_amount,
+          currency: extractedData.currency || "BDT",
+          category: "loan",
+          notes: `Loan from ${extractedData.lender_name}`,
+          type: "income",
+          date: extractedData.date || new Date().toISOString().split("T")[0],
+        });
+        response = generateLoanResponseMessage(extractedData, loan);
+      } else {
+        response = "I couldn't extract the loan details. Please provide the loan amount and lender name.";
+      }
+    } else if (extractedData.intent === "loan_repayment") {
+      // Handle loan repayment
+      if (extractedData.amount && extractedData.lender_name) {
+        const result = await recordLoanRepayment(
+          userId,
+          extractedData.lender_name,
+          extractedData.amount,
+          extractedData.date || new Date().toISOString().split("T")[0],
+          extractedData.currency || "BDT"
+        );
+        response = generateRepaymentResponseMessage(extractedData, result);
+      } else {
+        response = "I couldn't extract the repayment details. Please provide the amount and which loan it's for.";
+      }
+    } else {
+      // Default: regular transaction (existing flow, unchanged)
+      if (extractedData.amount && extractedData.type) {
+        await saveTransaction({
+          userId,
+          amount: extractedData.amount,
+          currency: extractedData.currency || "BDT",
+          category: extractedData.category || "other",
+          notes: extractedData.notes || inputText,
+          type: extractedData.type,
+          date: extractedData.date || new Date().toISOString().split("T")[0],
+        });
+      }
+      response = generateResponseMessage(extractedData);
     }
-
-    // Generate response message
-    const response = generateResponseMessage(expenseData);
 
     res.json({
       output: response,
       reply: response,
-      data: expenseData,
+      data: extractedData,
     });
   } catch (error) {
     console.error("Error processing request:", error);
@@ -94,6 +133,32 @@ app.get("/api/transactions/:userId", async (req, res) => {
   } catch (error) {
     console.error("Error fetching transactions:", error);
     res.status(500).json({ error: "Failed to fetch transactions" });
+  }
+});
+
+// Get user loans
+app.get("/api/loans/:userId", async (req, res) => {
+  try {
+    const { userId } = req.params;
+    const { getLoans } = await import("./services/supabase.js");
+    const loans = await getLoans(userId);
+    res.json({ loans });
+  } catch (error) {
+    console.error("Error fetching loans:", error);
+    res.status(500).json({ error: "Failed to fetch loans" });
+  }
+});
+
+// Delete loan
+app.delete("/api/loans/:id", async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { deleteLoan } = await import("./services/supabase.js");
+    await deleteLoan(id);
+    res.json({ success: true });
+  } catch (error) {
+    console.error("Error deleting loan:", error);
+    res.status(500).json({ error: "Failed to delete loan" });
   }
 });
 
@@ -125,6 +190,45 @@ function generateResponseMessage(data) {
     data.date || "today"
   }`;
 }
+
+function generateLoanResponseMessage(data) {
+  const type = data.loan_type === "personal" ? "personal loan" : "bank loan";
+  let msg = `🏦 Loan recorded: ${data.currency || "BDT"} ${data.principal_amount} ${type} from ${data.lender_name}`;
+  if (data.interest_rate) msg += ` at ${data.interest_rate}% interest`;
+  if (data.tenure_months) msg += ` for ${data.tenure_months} months`;
+  msg += ` on ${data.date || "today"}`;
+  return msg;
+}
+
+function generateRepaymentResponseMessage(data, result) {
+  if (result.loan) {
+    const statusMsg = result.loan.status === "paid_off"
+      ? "🎉 This loan is now fully paid off!"
+      : `Remaining balance: ${result.loan.currency} ${Number(result.loan.remaining_balance).toFixed(2)}`;
+    return `💰 Repayment recorded: ${data.currency || "BDT"} ${data.amount} to ${data.lender_name}. ${statusMsg}`;
+  }
+  return `💰 Repayment of ${data.currency || "BDT"} ${data.amount} to ${data.lender_name} recorded as expense (no matching active loan found).`;
+}
+
+// Submit feedback
+app.post("/api/feedback", async (req, res) => {
+  try {
+    const { userId, userName, userEmail, rating, comment } = req.body;
+
+    if (!userId) {
+      return res.status(400).json({ error: "userId is required" });
+    }
+    if (!rating || rating < 1 || rating > 5) {
+      return res.status(400).json({ error: "rating must be between 1 and 5" });
+    }
+
+    await saveFeedback({ userId, userName, userEmail, rating, comment });
+    res.json({ success: true, message: "Feedback submitted successfully" });
+  } catch (error) {
+    console.error("Error saving feedback:", error);
+    res.status(500).json({ error: "Failed to save feedback" });
+  }
+});
 
 app.listen(PORT, () => {
   console.log(`🚀 Backend server running on http://localhost:${PORT}`);
